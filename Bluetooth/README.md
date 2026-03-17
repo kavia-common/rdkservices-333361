@@ -107,6 +107,9 @@ onPlaybackNewTrack
 onDeviceFound
 onDeviceLost
 onDiscoveredDevice
+
+# Additive event: emitted when a device disconnects while a pairing attempt is in progress
+onPairingAborted
 ```
 
 ## Full Reference

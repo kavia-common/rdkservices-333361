@@ -111,6 +111,17 @@ namespace WPEFramework {
             JsonArray getConnectedDevices();
             bool setDeviceConnection(long long int deviceID, const string &enable, const string &deviceType = "UNKNOWN DEVICE");
             bool setAudioStream(long long int deviceID, const string &audioStreamName);
+
+            // Pairing/disconnect observability & edge-case handling
+            //
+            // Contract:
+            // - markPairingInProgress(deviceID, true) must be called when a pairing attempt is initiated.
+            // - markPairingInProgress(deviceID, false) must be called when pairing completes/fails or is otherwise aborted.
+            // - onDeviceDisconnectedDuringPairing(...) emits a JSON-RPC notification to clients and logs a meaningful error.
+            void markPairingInProgress(const long long int deviceID, const bool inProgress);
+            bool isPairingInProgress(const long long int deviceID) const;
+            void onDeviceDisconnectedDuringPairing(const long long int deviceID, const string& name, const string& deviceType, const string& reason);
+
             bool setDevicePairing(long long int deviceID, bool pair);
             bool setBluetoothEnabled(const string &enabled);
             bool setBluetoothDiscoverable(bool enabled, int timeout);
@@ -163,6 +174,10 @@ namespace WPEFramework {
             static const string EVT_DEVICE_LOST_OR_OUT_OF_RANGE;
             static const string EVT_DEVICE_DISCOVERY_UPDATE;
 
+            // New event: device disconnected while pairing was in progress.
+            // This is additive (does not change existing onStatusChanged/onRequestFailed payloads).
+            static const string EVT_PAIRING_ABORTED;
+
             Bluetooth();
             virtual ~Bluetooth();
             virtual string Information() const override;
@@ -212,6 +227,10 @@ namespace WPEFramework {
             bool m_discoveryRunning;
             DiscoveryTimer m_discoveryTimer;
             friend class DiscoveryTimer;
+
+            // Tracks devices currently in a pairing flow (as initiated via pair/unpair wrappers).
+            // Used to detect mid-pairing disconnects and notify clients consistently.
+            std::set<long long int> m_pairingInProgress;
         };
 	} // Plugin
 } // WPEFramework

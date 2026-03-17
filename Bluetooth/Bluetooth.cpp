@@ -23,6 +23,8 @@
 
 #include <stdlib.h>
 
+#include <set>
+
 // IMPLEMENTATION NOTE
 //
 // Bluetooth Settings API in Thunder follows the schema proposed by Metrological what differs from the underlying
@@ -73,6 +75,9 @@ const string WPEFramework::Plugin::Bluetooth::EVT_PLAYBACK_NEW_TRACK = "onPlayba
 const string WPEFramework::Plugin::Bluetooth::EVT_DEVICE_FOUND = "onDeviceFound";
 const string WPEFramework::Plugin::Bluetooth::EVT_DEVICE_LOST_OR_OUT_OF_RANGE = "onDeviceLost";
 const string WPEFramework::Plugin::Bluetooth::EVT_DEVICE_DISCOVERY_UPDATE = "onDiscoveredDevice";
+
+// Additive event to cover a missing edge case: BLE disconnect mid-pairing
+const string WPEFramework::Plugin::Bluetooth::EVT_PAIRING_ABORTED = "onPairingAborted";
 
 const string WPEFramework::Plugin::Bluetooth::STATUS_NO_BLUETOOTH_HARDWARE = "NO_BLUETOOTH_HARDWARE";
 const string WPEFramework::Plugin::Bluetooth::STATUS_SOFTWARE_DISABLED = "SOFTWARE_DISABLED";
@@ -132,6 +137,7 @@ namespace WPEFramework
         , m_apiVersionNumber(API_VERSION_NUMBER_MAJOR)
         , m_discoveryRunning(false)
         , m_discoveryTimer(this)
+        , m_pairingInProgress()
         {
             LOGINFO();
             Bluetooth::_instance = this;
@@ -489,8 +495,48 @@ namespace WPEFramework
             return BTRMGR_RESULT_SUCCESS == rc;
         }
 
+        void Bluetooth::markPairingInProgress(const long long int deviceID, const bool inProgress)
+        {
+            if (inProgress) {
+                m_pairingInProgress.insert(deviceID);
+            } else {
+                m_pairingInProgress.erase(deviceID);
+            }
+        }
+
+        bool Bluetooth::isPairingInProgress(const long long int deviceID) const
+        {
+            return (m_pairingInProgress.find(deviceID) != m_pairingInProgress.end());
+        }
+
+        void Bluetooth::onDeviceDisconnectedDuringPairing(const long long int deviceID, const string& name, const string& deviceType, const string& reason)
+        {
+            // Centralized flow for this edge case:
+            // - log a meaningful error
+            // - emit a dedicated JSON-RPC notification so clients can distinguish this from generic disconnects.
+            LOGERR("Pairing aborted due to disconnect (deviceID=%lld name='%s' deviceType='%s' reason='%s')",
+                   deviceID, C_STR(name), C_STR(deviceType), C_STR(reason));
+
+            JsonObject params;
+            params["deviceID"] = std::to_string(deviceID);
+            if (!name.empty()) {
+                params["name"] = name;
+            }
+            if (!deviceType.empty()) {
+                params["deviceType"] = deviceType;
+            }
+            params["reason"] = reason;
+
+            sendNotify(C_STR(EVT_PAIRING_ABORTED), params);
+        }
+
         bool Bluetooth::setDevicePairing(long long int deviceID, bool pair)
         {
+            // Flow contract:
+            // - When pairing/unpairing is initiated we mark it in-progress so we can detect mid-flow disconnects.
+            // - Completion/failure events clear the in-progress marker.
+            markPairingInProgress(deviceID, true);
+
             BTRMGR_Result_t rc = BTRMGR_RESULT_SUCCESS;
             BTRMgrDeviceHandle deviceHandle = (BTRMgrDeviceHandle) deviceID;
             if (pair)
@@ -502,9 +548,11 @@ namespace WPEFramework
 
             if (BTRMGR_RESULT_SUCCESS != rc)
             {
-                LOGERR("Failed to do %s ", (pair ? "Pair" : "Unpair"));
+                // Immediate failure => the flow is no longer in-progress.
+                markPairingInProgress(deviceID, false);
+                LOGERR("Failed to do %s (deviceID=%lld)", (pair ? "Pair" : "Unpair"), deviceID);
             } else {
-                LOGINFO("Successfully done %s ", (pair ? "Pair" : "Unpair"));
+                LOGINFO("Successfully requested %s (deviceID=%lld)", (pair ? "Pair" : "Unpair"), deviceID);
             }
             return BTRMGR_RESULT_SUCCESS == rc;
         }
@@ -767,7 +815,10 @@ namespace WPEFramework
                     //       events from BTRMgr ??
                     break;
 
-                case BTRMGR_EVENT_DEVICE_PAIRING_COMPLETE:
+                case BTRMGR_EVENT_DEVICE_PAIRING_COMPLETE: {
+                    const long long int deviceID = static_cast<long long int>(eventMsg.m_discoveredDevice.m_deviceHandle);
+                    markPairingInProgress(deviceID, false);
+
                     LOGINFO ("Received %s Event from BTRMgr", C_STR(STATUS_PAIRING_CHANGE));
                     params["newStatus"] = STATUS_PAIRING_CHANGE;
                     params["deviceID"] = C_STR(std::to_string(eventMsg.m_discoveredDevice.m_deviceHandle));
@@ -780,8 +831,12 @@ namespace WPEFramework
 
                     eventId = EVT_STATUS_CHANGED;
                     break;
+                }
 
-                case BTRMGR_EVENT_DEVICE_UNPAIRING_COMPLETE:
+                case BTRMGR_EVENT_DEVICE_UNPAIRING_COMPLETE: {
+                    const long long int deviceID = static_cast<long long int>(eventMsg.m_pairedDevice.m_deviceHandle);
+                    markPairingInProgress(deviceID, false);
+
                     LOGINFO ("Received %s Event from BTRMgr", C_STR(STATUS_PAIRING_CHANGE));
                     params["newStatus"] = STATUS_PAIRING_CHANGE;
                     params["deviceID"] = std::to_string(eventMsg.m_pairedDevice.m_deviceHandle);
@@ -794,6 +849,7 @@ namespace WPEFramework
 
                     eventId = EVT_STATUS_CHANGED;
                     break;
+                }
 
                 case BTRMGR_EVENT_DEVICE_CONNECTION_COMPLETE:
                 case BTRMGR_EVENT_DEVICE_DISCONNECT_COMPLETE: /* Allow only AudioIn/Out & HID Connection Event propogation to XRE for now */
@@ -807,6 +863,18 @@ namespace WPEFramework
                         (eventMsg.m_pairedDevice.m_deviceType == BTRMGR_DEVICE_TYPE_SMARTPHONE)         ||
                         (eventMsg.m_pairedDevice.m_deviceType == BTRMGR_DEVICE_TYPE_TABLET)             ||
                         (eventMsg.m_pairedDevice.m_deviceType == BTRMGR_DEVICE_TYPE_HID)                ){
+
+                        const long long int deviceID = static_cast<long long int>(eventMsg.m_pairedDevice.m_deviceHandle);
+
+                        // Edge case: device disconnected while a pairing attempt is in progress.
+                        // This is common for BLE peripherals that drop link during bonding/pairing.
+                        if ((eventMsg.m_eventType == BTRMGR_EVENT_DEVICE_DISCONNECT_COMPLETE) && isPairingInProgress(deviceID)) {
+                            markPairingInProgress(deviceID, false);
+
+                            const string name = string(eventMsg.m_pairedDevice.m_name);
+                            const string type = string(BTRMGR_GetDeviceTypeAsString(eventMsg.m_pairedDevice.m_deviceType));
+                            onDeviceDisconnectedDuringPairing(deviceID, name, type, "disconnect_complete_during_pairing");
+                        }
 
                         LOGINFO ("Received %s Event from BTRMgr", C_STR(STATUS_CONNECTION_CHANGE));
                         params["newStatus"] = STATUS_CONNECTION_CHANGE;
@@ -855,8 +923,13 @@ namespace WPEFramework
                     eventId = EVT_PAIRING_REQUEST;
                     break;
 
-                case BTRMGR_EVENT_DEVICE_PAIRING_FAILED:
-                    LOGERR("Received %s Event from BTRMgr", C_STR(STATUS_PAIRING_FAILED));
+                case BTRMGR_EVENT_DEVICE_PAIRING_FAILED: {
+                    const long long int deviceID = static_cast<long long int>(eventMsg.m_discoveredDevice.m_deviceHandle);
+                    markPairingInProgress(deviceID, false);
+
+                    LOGERR("Received %s Event from BTRMgr (deviceID=%lld name='%s')",
+                           C_STR(STATUS_PAIRING_FAILED), deviceID, eventMsg.m_discoveredDevice.m_name);
+
                     params["newStatus"] = STATUS_PAIRING_FAILED;
                     params["deviceID"] = std::to_string(eventMsg.m_discoveredDevice.m_deviceHandle);
                     params["name"] = string(eventMsg.m_discoveredDevice.m_name);
@@ -868,9 +941,15 @@ namespace WPEFramework
 
                     eventId = EVT_REQUEST_FAILED;
                     break;
+                }
 
-                case BTRMGR_EVENT_DEVICE_UNPAIRING_FAILED:
-                    LOGERR("Received %s Event from BTRMgr", C_STR(STATUS_PAIRING_FAILED));
+                case BTRMGR_EVENT_DEVICE_UNPAIRING_FAILED: {
+                    const long long int deviceID = static_cast<long long int>(eventMsg.m_pairedDevice.m_deviceHandle);
+                    markPairingInProgress(deviceID, false);
+
+                    LOGERR("Received %s Event from BTRMgr (deviceID=%lld name='%s')",
+                           C_STR(STATUS_PAIRING_FAILED), deviceID, eventMsg.m_pairedDevice.m_name);
+
                     params["newStatus"] = STATUS_PAIRING_FAILED;
                     params["deviceID"] = std::to_string(eventMsg.m_pairedDevice.m_deviceHandle);
                     params["name"] = string(eventMsg.m_pairedDevice.m_name);
@@ -882,6 +961,7 @@ namespace WPEFramework
 
                     eventId = EVT_REQUEST_FAILED;
                     break;
+                }
 
                 case BTRMGR_EVENT_DEVICE_CONNECTION_FAILED:
                 case BTRMGR_EVENT_DEVICE_DISCONNECT_FAILED: /* Allow only AudioIn/Out & HID Connection Event propogation to XRE for now */
